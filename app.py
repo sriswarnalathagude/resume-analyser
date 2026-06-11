@@ -13,15 +13,13 @@ from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['OUTPUT_FOLDER'] = 'outputs'
-app.config['RATE_LIMIT_FILE'] = 'rate_limits.json'
+app.config['UPLOAD_FOLDER'] = '/tmp/uploads'
+app.config['OUTPUT_FOLDER'] = '/tmp/outputs'
+app.config['RATE_LIMIT_FILE'] = '/tmp/rate_limits.json'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 app.config['DAILY_LIMIT'] = 5
 
 # ── API key configuration ────────────────────────────────────────
-# For local testing: paste your key here directly.
-# For Vercel/production: set the 'gemini_api_key' environment variable — leave this as "".
 HARDCODED_API_KEY = ""
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
@@ -30,7 +28,7 @@ os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 session_data = {}
 
 # ────────────────────────────────────────────────────────────────
-# Rate limiting  (file-based JSON – no Redis needed)
+# Rate limiting
 # ────────────────────────────────────────────────────────────────
 
 def _load_rate_data():
@@ -48,12 +46,10 @@ def _save_rate_data(data):
         json.dump(data, f)
 
 def get_client_id():
-    """Stable per-client fingerprint from IP + User-Agent."""
     raw = (request.remote_addr or '') + (request.headers.get('User-Agent', ''))
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 def check_rate_limit():
-    """Returns (allowed: bool, used: int, limit: int)."""
     client_id = get_client_id()
     today = str(date.today())
     data = _load_rate_data()
@@ -90,12 +86,11 @@ def extract_text_from_file(filepath):
     return ""
 
 def make_cache_key(resume_text, name, job_role, job_description, preferred_location):
-    """SHA-256 of all inputs – same inputs always produce the same key."""
     combined = f"{resume_text}|{name}|{job_role}|{job_description}|{preferred_location}"
     return hashlib.sha256(combined.encode()).hexdigest()
 
 # ────────────────────────────────────────────────────────────────
-# DOCX builder – pure Python, no pdflatex required
+# DOCX builder
 # ────────────────────────────────────────────────────────────────
 
 def build_optimized_docx(user_info, analysis, resume_text, output_path):
@@ -134,7 +129,6 @@ def build_optimized_docx(user_info, analysis, resume_text, output_path):
         run.font.size = Pt(9)
         run.font.color.rgb = RGBColor(0xC0, 0x6C, 0x2C)
         p.paragraph_format.space_after = Pt(2)
-        # Bottom border
         pPr = p._p.get_or_add_pPr()
         pBdr = OxmlElement('w:pBdr')
         bottom = OxmlElement('w:bottom')
@@ -188,7 +182,7 @@ def build_optimized_docx(user_info, analysis, resume_text, output_path):
             bullet_item(item)
         doc.add_paragraph()
 
-    # ── Original / Enhanced Resume Content ──
+    # ── Resume Content ──
     section_heading("Resume Content")
     for line in resume_text.split('\n'):
         line = line.strip()
@@ -250,8 +244,6 @@ def analyze():
     if not session_id or session_id not in session_data:
         return jsonify({'error': 'Invalid session. Please upload your resume first.'}), 400
 
-    # ── API key resolution (priority: user input → env var → hardcoded fallback) ──
-    # HARDCODED_API_KEY is checked last so env var always takes precedence in production
     server_key = (
         os.environ.get('GEMINI_API_KEY', '').strip()
         or HARDCODED_API_KEY.strip()
@@ -273,7 +265,7 @@ def analyze():
         using_server_key = True
     else:
         return jsonify({
-            'error': 'No API key configured. Set the gemini_api_key environment variable or paste your key in the field above.'
+            'error': 'No API key configured. Set the GEMINI_API_KEY environment variable or paste your key in the field above.'
         }), 400
 
     resume_path = session_data[session_id]['resume_path']
@@ -282,7 +274,6 @@ def analyze():
     if not resume_text.strip():
         return jsonify({'error': 'Could not extract text from resume. Ensure it is not a scanned image.'}), 400
 
-    # ── Deterministic caching: same inputs → same result ──
     cache_key = make_cache_key(resume_text, name, job_role, job_desc, location)
     if (session_data[session_id].get('cache_key') == cache_key
             and 'analysis' in session_data[session_id]):
@@ -297,7 +288,6 @@ def analyze():
 
     try:
         genai.configure(api_key=api_key)
-        # temperature=0 → fully deterministic outputs for the same prompt
         model = genai.GenerativeModel(
             'gemini-2.5-flash',
             generation_config=genai.GenerationConfig(temperature=0)
@@ -346,7 +336,6 @@ Return this exact JSON. Use concise bullet-style strings (≤15 words each) for 
 
         analysis = json.loads(raw)
 
-        # Increment only on successful server-key usage
         if using_server_key:
             increment_rate_limit()
 
@@ -374,7 +363,6 @@ Return this exact JSON. Use concise bullet-style strings (≤15 words each) for 
     except json.JSONDecodeError as e:
         return jsonify({'error': f'AI returned malformed JSON. Try again. Detail: {str(e)}'}), 500
     except Exception as e:
-        # Surface the real Gemini error (invalid key, quota, etc.)
         err_msg = str(e)
         if 'API_KEY_INVALID' in err_msg or 'API key not valid' in err_msg:
             return jsonify({'error': 'Invalid Gemini API key. Check your key and try again.'}), 401
@@ -394,11 +382,10 @@ def generate_resume():
         return jsonify({'error': 'Please run analysis first'}), 400
 
     try:
-        analysis   = sd['analysis']
-        user_info  = sd['user_info']
+        analysis    = sd['analysis']
+        user_info   = sd['user_info']
         resume_text = sd['resume_text']
 
-        # ── Optionally get AI-enhanced text ──
         enhanced_text = resume_text
         try:
             genai.configure(api_key=sd['api_key'])
@@ -426,7 +413,7 @@ No markdown, no JSON. Keep under 700 words."""
             resp = model.generate_content(enhance_prompt)
             enhanced_text = resp.text.strip()
         except Exception:
-            pass  # Fall back to original resume text
+            pass
 
         safe_name       = re.sub(r'[^a-zA-Z0-9_-]', '_', user_info.get('name', 'resume')) or 'resume'
         output_filename = f"{safe_name}_optimized_resume.docx"
