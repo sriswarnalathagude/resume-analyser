@@ -578,6 +578,10 @@
 <script>
 "use strict";
 let sessionId = null;
+let resumeText = null;
+let lastUserInfo = null;
+let lastAnalysis = null;
+let lastApiKey = '';
 
 /* ── Upload ── */
 const dropZone  = document.getElementById('dropZone');
@@ -602,6 +606,7 @@ async function handleUpload() {
     const data = await res.json();
     if (data.success) {
       sessionId = data.session_id;
+      resumeText = data.resume_text;
       const ok = document.getElementById('uploadOk');
       ok.style.display = 'flex';
       document.getElementById('uploadedName').textContent = data.filename + ' — ready';
@@ -612,7 +617,7 @@ async function handleUpload() {
 
 /* ── Analyze ── */
 async function runAnalysis() {
-  if (!sessionId) { showError('Please upload your resume first.'); return; }
+  if (!sessionId || !resumeText) { showError('Please upload your resume first.'); return; }
   const name    = document.getElementById('name').value.trim();
   const jobRole = document.getElementById('jobRole').value.trim();
   const jobDesc = document.getElementById('jobDesc').value.trim();
@@ -624,10 +629,14 @@ async function runAnalysis() {
   try {
     const res  = await fetch('/analyze', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId, name, job_role: jobRole, job_description: jobDesc, preferred_location: loc, api_key: apiKey })
+      body: JSON.stringify({ session_id: sessionId, resume_text: resumeText, name, job_role: jobRole, job_description: jobDesc, preferred_location: loc, api_key: apiKey })
     });
     const data = await res.json();
     if (data.success) {
+      lastAnalysis  = data.analysis;
+      lastUserInfo  = data.user_info || { name, job_role: jobRole, job_description: jobDesc, preferred_location: loc };
+      lastApiKey    = data.api_key_used || apiKey || '';
+      if (data.resume_text) resumeText = data.resume_text;
       renderResults(data.analysis, data.cached);
       if (data.rate_used != null) updateRatePill(data.rate_used, data.rate_limit);
       if (data.cached) showInfo('Results loaded from cache — same inputs detected.');
@@ -642,18 +651,34 @@ async function runAnalysis() {
 
 /* ── Generate ── */
 async function generateResume() {
-  if (!sessionId) return;
+  if (!sessionId || !resumeText || !lastAnalysis || !lastUserInfo) return;
   const errEl = document.getElementById('generateErr');
   errEl.style.display = 'none';
   setBtnLoading('generateBtn', 'generateLabel', true, 'Generating…');
   try {
     const res  = await fetch('/generate_resume', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId })
+      body: JSON.stringify({
+        session_id: sessionId,
+        resume_text: resumeText,
+        user_info: lastUserInfo,
+        analysis: lastAnalysis,
+        api_key: lastApiKey
+      })
     });
     const data = await res.json();
-    if (data.success) { window.location.href = '/download/' + data.filename; }
-    else { errEl.textContent = data.error || 'Generation failed.'; errEl.style.display = 'block'; }
+    if (data.success && data.file_base64) {
+      const byteChars = atob(data.file_base64);
+      const byteNums  = new Array(byteChars.length);
+      for (let i = 0; i < byteChars.length; i++) byteNums[i] = byteChars.charCodeAt(i);
+      const byteArray = new Uint8Array(byteNums);
+      const blob = new Blob([byteArray], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = data.filename;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } else { errEl.textContent = data.error || 'Generation failed.'; errEl.style.display = 'block'; }
   } catch (e) { errEl.textContent = 'Request error: ' + e.message; errEl.style.display = 'block'; }
   finally { setBtnLoading('generateBtn', 'generateLabel', false, '⬇ Generate & Download DOCX'); }
 }
