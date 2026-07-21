@@ -220,11 +220,40 @@ def upload_resume():
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in allowed_ext:
         return jsonify({'error': 'Only PDF and DOCX files are allowed'}), 400
+
     session_id = str(uuid.uuid4())
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}{ext}")
-    file.save(filepath)
-    session_data[session_id] = {'resume_path': filepath, 'resume_filename': file.filename}
-    return jsonify({'success': True, 'session_id': session_id, 'filename': file.filename})
+
+    try:
+        file.save(filepath)
+        resume_text = extract_text_from_file(filepath)
+    except Exception as e:
+        return jsonify({'error': f'Could not read file: {str(e)}'}), 400
+    finally:
+        # Don't rely on this file surviving to the next request (serverless
+        # instances are stateless / ephemeral) — clean it up immediately.
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+    if not resume_text.strip():
+        return jsonify({'error': 'Could not extract text from resume. Ensure it is not a scanned image.'}), 400
+
+    # session_data is best-effort only (helps if a later request happens to
+    # land on the same warm instance) — it is NOT relied upon for correctness.
+    # The extracted text is sent back to the client and round-tripped on
+    # subsequent requests, so the app works correctly even when Vercel routes
+    # /upload, /analyze and /generate_resume to different function instances.
+    session_data[session_id] = {'resume_filename': file.filename, 'resume_text': resume_text}
+
+    return jsonify({
+        'success': True,
+        'session_id': session_id,
+        'filename': file.filename,
+        'resume_text': resume_text
+    })
 
 @app.route('/rate_status', methods=['GET'])
 def rate_status():
@@ -233,7 +262,7 @@ def rate_status():
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    data         = request.json
+    data         = request.json or {}
     session_id   = data.get('session_id')
     name         = data.get('name', '').strip()
     job_role     = data.get('job_role', '').strip()
@@ -241,8 +270,18 @@ def analyze():
     location     = data.get('preferred_location', '').strip()
     user_api_key = data.get('api_key', '').strip()
 
-    if not session_id or session_id not in session_data:
+    # Prefer resume_text sent directly by the client (works regardless of
+    # which serverless instance handles this request). Fall back to the
+    # in-memory session store only if present (same warm instance as /upload).
+    resume_text = data.get('resume_text', '').strip()
+    if not resume_text and session_id and session_id in session_data:
+        resume_text = session_data[session_id].get('resume_text', '')
+
+    if not resume_text:
         return jsonify({'error': 'Invalid session. Please upload your resume first.'}), 400
+
+    if not session_id:
+        session_id = str(uuid.uuid4())
 
     server_key = (
         os.environ.get('GEMINI_API_KEY', '').strip()
@@ -268,14 +307,9 @@ def analyze():
             'error': 'No API key configured. Set the GEMINI_API_KEY environment variable or paste your key in the field above.'
         }), 400
 
-    resume_path = session_data[session_id]['resume_path']
-    resume_text = extract_text_from_file(resume_path)
-
-    if not resume_text.strip():
-        return jsonify({'error': 'Could not extract text from resume. Ensure it is not a scanned image.'}), 400
-
     cache_key = make_cache_key(resume_text, name, job_role, job_desc, location)
-    if (session_data[session_id].get('cache_key') == cache_key
+    if (session_id in session_data
+            and session_data[session_id].get('cache_key') == cache_key
             and 'analysis' in session_data[session_id]):
         allowed, used, limit = check_rate_limit()
         return jsonify({
@@ -339,25 +373,36 @@ Return this exact JSON. Use concise bullet-style strings (≤15 words each) for 
         if using_server_key:
             increment_rate_limit()
 
-        session_data[session_id].update({
+        user_info = {
+            'name': name,
+            'job_role': job_role,
+            'job_description': job_desc,
+            'preferred_location': location
+        }
+
+        # Best-effort cache for this warm instance only — not relied upon.
+        session_data[session_id] = {
             'analysis': analysis,
             'resume_text': resume_text,
             'cache_key': cache_key,
             'api_key': api_key,
-            'user_info': {
-                'name': name,
-                'job_role': job_role,
-                'job_description': job_desc,
-                'preferred_location': location
-            }
-        })
+            'user_info': user_info
+        }
 
         allowed, used, limit = check_rate_limit()
         return jsonify({
             'success': True,
             'analysis': analysis,
             'rate_used': used,
-            'rate_limit': limit
+            'rate_limit': limit,
+            # Echoed back so the client can carry this forward to
+            # /generate_resume without depending on server-side session state.
+            'session_id': session_id,
+            'resume_text': resume_text,
+            'user_info': user_info,
+            # Only echo back the key if the user supplied their own — never
+            # leak the server-configured key to the client.
+            'api_key_used': (api_key if not using_server_key else '')
         })
 
     except json.JSONDecodeError as e:
@@ -372,23 +417,34 @@ Return this exact JSON. Use concise bullet-style strings (≤15 words each) for 
 
 @app.route('/generate_resume', methods=['POST'])
 def generate_resume():
-    data = request.json
+    data = request.json or {}
     session_id = data.get('session_id')
 
-    if not session_id or session_id not in session_data:
-        return jsonify({'error': 'Invalid session'}), 400
-    sd = session_data[session_id]
-    if 'analysis' not in sd:
+    # Prefer everything sent directly by the client (works regardless of
+    # which serverless instance handles this request). Fall back to the
+    # in-memory session store only if present (same warm instance).
+    analysis    = data.get('analysis')
+    user_info   = data.get('user_info')
+    resume_text = data.get('resume_text', '').strip()
+    api_key     = data.get('api_key', '').strip()
+
+    if (not analysis or not user_info or not resume_text) and session_id and session_id in session_data:
+        sd = session_data[session_id]
+        analysis    = analysis or sd.get('analysis')
+        user_info   = user_info or sd.get('user_info')
+        resume_text = resume_text or sd.get('resume_text', '')
+        api_key     = api_key or sd.get('api_key', '')
+
+    if not analysis or not user_info or not resume_text:
         return jsonify({'error': 'Please run analysis first'}), 400
 
-    try:
-        analysis    = sd['analysis']
-        user_info   = sd['user_info']
-        resume_text = sd['resume_text']
+    if not api_key:
+        api_key = os.environ.get('GEMINI_API_KEY', '').strip() or HARDCODED_API_KEY.strip()
 
+    try:
         enhanced_text = resume_text
         try:
-            genai.configure(api_key=sd['api_key'])
+            genai.configure(api_key=api_key)
             model = genai.GenerativeModel(
                 'gemini-2.5-flash',
                 generation_config=genai.GenerationConfig(temperature=0)
@@ -421,21 +477,26 @@ No markdown, no JSON. Keep under 700 words."""
 
         build_optimized_docx(user_info, analysis, enhanced_text, output_path)
 
-        if os.path.exists(output_path):
-            sd['output_docx'] = output_path
-            return jsonify({'success': True, 'filename': output_filename, 'format': 'docx'})
-        return jsonify({'error': 'Failed to create resume document'}), 500
+        if not os.path.exists(output_path):
+            return jsonify({'error': 'Failed to create resume document'}), 500
+
+        import base64
+        with open(output_path, 'rb') as f:
+            file_b64 = base64.b64encode(f.read()).decode('ascii')
+        try:
+            os.remove(output_path)
+        except Exception:
+            pass
+
+        return jsonify({
+            'success': True,
+            'filename': output_filename,
+            'format': 'docx',
+            'file_base64': file_b64
+        })
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
-@app.route('/download/<filename>')
-def download(filename):
-    safe = re.sub(r'[^a-zA-Z0-9_\-.]', '', filename)
-    path = os.path.join(app.config['OUTPUT_FOLDER'], safe)
-    if os.path.exists(path):
-        return send_file(path, as_attachment=True, download_name=safe)
-    return jsonify({'error': 'File not found'}), 404
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
